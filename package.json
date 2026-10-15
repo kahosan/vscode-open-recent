@@ -62,7 +62,8 @@
     "typescript": "^5.8.0"
   },
   "scripts": {
+    "dev": "ray develop",
     "build": "ray build -e dist",
-    "dev": "ray develop"
+    "publish": "ray publish"
   }
 }
