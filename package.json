@@ -3,14 +3,21 @@
   "name": "vscode-open-recent",
   "title": "VS Code Open Recent",
   "description": "Open recent VS Code projects (minimal, Raycast v1 compatible)",
+  "categories": [
+    "Developer Tools"
+  ],
   "icon": "icon.png",
+  "scripts": {
+    "dev": "ray develop",
+    "build": "ray build -e dist",
+    "publish": "ray publish",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix"
+  },
   "author": "kaho",
   "license": "MIT",
   "platforms": [
     "macOS"
-  ],
-  "categories": [
-    "Developer Tools"
   ],
   "commands": [
     {
@@ -54,17 +61,15 @@
   ],
   "dependencies": {
     "@raycast/api": "^1.104.24",
-    "@raycast/utils": "^2.2.7"
+    "@raycast/utils": "^2.2.7",
+    "foxts": "^5.9.1"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/react": "^19.2.8",
+    "eslint": "^10.12.0",
+    "eslint-config-kaho": "^5.0.2",
     "typescript": "^5.8.0"
-  },
-  "scripts": {
-    "dev": "ray develop",
-    "build": "ray build -e dist",
-    "publish": "ray publish"
   },
   "allowScripts": {
     "esbuild": false

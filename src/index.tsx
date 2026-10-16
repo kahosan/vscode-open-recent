@@ -1,54 +1,58 @@
-import { Action, ActionPanel, getPreferenceValues, Icon, Image, List, showToast, Toast } from "@raycast/api";
-import { useSQL } from "@raycast/utils";
-import { execFile } from "child_process";
-import { existsSync, readFileSync } from "fs";
-import { homedir } from "os";
-import { basename, dirname, join } from "path";
-import { fileURLToPath } from "url";
-import { promisify } from "util";
+import type { Image } from '@raycast/api';
+
+import { homedir } from 'os';
+import { promisify } from 'util';
+import { fileURLToPath } from 'url';
+import { execFile } from 'child_process';
+import { existsSync, readFileSync } from 'fs';
+import { basename, dirname, join } from 'path';
+
+import { useSQL } from '@raycast/utils';
+import { extractErrorMessage } from 'foxts/extract-error-message';
+import { Action, ActionPanel, getPreferenceValues, Icon, List, showToast, Toast } from '@raycast/api';
 
 const execFileAsync = promisify(execFile);
 
 // App bundles can live in either of these directories.
-const APP_DIRS = ["/Applications", join(homedir(), "Applications")];
+const APP_DIRS = ['/Applications', join(homedir(), 'Applications')];
 
-type Build = { app: string; bundle: string; scheme: string };
+interface Build { app: string, bundle: string, scheme: string }
 
 // build (folder under ~/Library/Application Support) -> app name for `open -a`,
 // app bundle (to find product.json) and URL scheme for remote entries
 const BUILDS: Record<string, Build> = {
-  Code: { app: "Visual Studio Code", bundle: "Visual Studio Code.app", scheme: "vscode" },
-  "Code - Insiders": {
-    app: "Visual Studio Code - Insiders",
-    bundle: "Visual Studio Code - Insiders.app",
-    scheme: "vscode-insiders",
+  Code: { app: 'Visual Studio Code', bundle: 'Visual Studio Code.app', scheme: 'vscode' },
+  'Code - Insiders': {
+    app: 'Visual Studio Code - Insiders',
+    bundle: 'Visual Studio Code - Insiders.app',
+    scheme: 'vscode-insiders'
   },
-  Cursor: { app: "Cursor", bundle: "Cursor.app", scheme: "cursor" },
-  VSCodium: { app: "VSCodium", bundle: "VSCodium.app", scheme: "vscode-oss" },
-  Windsurf: { app: "Windsurf", bundle: "Windsurf.app", scheme: "windsurf" },
+  Cursor: { app: 'Cursor', bundle: 'Cursor.app', scheme: 'cursor' },
+  VSCodium: { app: 'VSCodium', bundle: 'VSCodium.app', scheme: 'vscode-oss' },
+  Windsurf: { app: 'Windsurf', bundle: 'Windsurf.app', scheme: 'windsurf' }
 };
 
-const build = getPreferenceValues<Preferences>().build || "Code";
+const build = getPreferenceValues<Preferences>().build;
 const { app: appName, bundle, scheme } = BUILDS[build] ?? BUILDS.Code;
 
 function findInAppDirs(...segments: string[]): string | undefined {
-  return APP_DIRS.map((dir) => join(dir, ...segments)).find((candidate) => existsSync(candidate));
+  return APP_DIRS.map(dir => join(dir, ...segments)).find(candidate => existsSync(candidate));
 }
 
 const appPath = findInAppDirs(bundle);
 const appIcon: Image.ImageLike = appPath ? { fileIcon: appPath } : Icon.Code;
-const globalStorageDir = join(homedir(), "Library", "Application Support", build, "User", "globalStorage");
+const globalStorageDir = join(homedir(), 'Library', 'Application Support', build, 'User', 'globalStorage');
 
 // Newer builds keep the recent list in a shared DB: ~/<sharedDataFolderName>/sharedStorage/state.vscdb
 // (folder name comes from the app's product.json). Same lookup order as the original extension.
 function getSharedDbPath(): string | undefined {
-  const productJson = findInAppDirs(bundle, "Contents", "Resources", "app", "product.json");
+  const productJson = findInAppDirs(bundle, 'Contents', 'Resources', 'app', 'product.json');
   if (!productJson) return undefined;
   try {
-    const { sharedDataFolderName } = JSON.parse(readFileSync(productJson, "utf-8")) as {
-      sharedDataFolderName?: string;
+    const { sharedDataFolderName } = JSON.parse(readFileSync(productJson, 'utf-8')) as {
+      sharedDataFolderName?: string
     };
-    return sharedDataFolderName ? join(homedir(), sharedDataFolderName, "sharedStorage", "state.vscdb") : undefined;
+    return sharedDataFolderName ? join(homedir(), sharedDataFolderName, 'sharedStorage', 'state.vscdb') : undefined;
   } catch {
     return undefined;
   }
@@ -56,34 +60,34 @@ function getSharedDbPath(): string | undefined {
 
 function getDbPath(): string {
   const shared = getSharedDbPath();
-  return shared && existsSync(shared) ? shared : join(globalStorageDir, "state.vscdb");
+  return shared && existsSync(shared) ? shared : join(globalStorageDir, 'state.vscdb');
 }
 
 const dbPath = getDbPath();
 
-type Row = { entries: string };
+interface Row { entries: string }
 
-type Entry = {
-  folderUri?: string;
-  fileUri?: string;
-  workspace?: { configPath: string };
-  remoteAuthority?: string;
-  label?: string;
-};
+interface Entry {
+  folderUri?: string
+  fileUri?: string
+  workspace?: { configPath: string }
+  remoteAuthority?: string
+  label?: string
+}
 
-type Kind = "folder" | "workspace" | "file";
+type Kind = 'folder' | 'workspace' | 'file';
 
-type ItemBase = {
-  uri: string;
-  kind: Kind;
-  title: string;
-  subtitle: string;
-  keywords: string[];
-  icon: Image.ImageLike;
-};
+interface ItemBase {
+  uri: string
+  kind: Kind
+  title: string
+  subtitle: string
+  keywords: string[]
+  icon: Image.ImageLike
+}
 
-type LocalItem = ItemBase & { remote: false; localPath: string };
-type RemoteItem = ItemBase & { remote: true; tag: string };
+type LocalItem = ItemBase & { remote: false, localPath: string };
+type RemoteItem = ItemBase & { remote: true, tag: string };
 type Item = LocalItem | RemoteItem;
 
 // Same key the original extension reads (older builds used history.recentlyOpenedPathsList).
@@ -96,11 +100,11 @@ const QUERY = `
 `;
 
 function formatAuthority(authority: string): string {
-  if (authority.startsWith("ssh-remote+")) return `SSH: ${authority.slice("ssh-remote+".length)}`;
-  if (authority.startsWith("wsl+")) return `WSL: ${authority.slice(4)}`;
-  if (authority.startsWith("dev-container+")) return "Dev Container";
-  if (authority.startsWith("attached-container+")) return "Container";
-  if (authority.startsWith("codespaces+")) return "Codespaces";
+  if (authority.startsWith('ssh-remote+')) return `SSH: ${authority.slice('ssh-remote+'.length)}`;
+  if (authority.startsWith('wsl+')) return `WSL: ${authority.slice(4)}`;
+  if (authority.startsWith('dev-container+')) return 'Dev Container';
+  if (authority.startsWith('attached-container+')) return 'Container';
+  if (authority.startsWith('codespaces+')) return 'Codespaces';
   return authority;
 }
 
@@ -131,15 +135,15 @@ function toLocalItem(uri: string, kind: Kind): LocalItem | undefined {
     remote: false,
     icon: { fileIcon: path },
     title: basename(path),
-    subtitle: dirname(path).replace(homedir(), "~"),
-    keywords: path.split("/").filter(Boolean),
-    localPath: path,
+    subtitle: dirname(path).replace(homedir(), '~'),
+    keywords: path.split('/').filter(Boolean),
+    localPath: path
   };
 }
 
 function toRemoteItem(uri: string, kind: Kind, entry: Entry): RemoteItem {
   const authority = entry.remoteAuthority ?? safeDecode(new URL(uri).host);
-  let remotePath = "/";
+  let remotePath = '/';
   try {
     remotePath = safeDecode(new URL(uri).pathname);
   } catch {
@@ -154,10 +158,10 @@ function toRemoteItem(uri: string, kind: Kind, entry: Entry): RemoteItem {
     subtitle: dirname(remotePath),
     tag: formatAuthority(authority),
     keywords: [
-      ...authority.split("+"),
-      ...remotePath.split("/").filter(Boolean),
-      ...(entry.label ? [entry.label] : []),
-    ],
+      ...authority.split('+'),
+      ...remotePath.split('/').filter(Boolean),
+      ...(entry.label ? [entry.label] : [])
+    ]
   };
 }
 
@@ -170,12 +174,12 @@ function toItems(rows: Row[] | undefined): Item[] {
     const uri = entry.folderUri ?? entry.workspace?.configPath ?? entry.fileUri;
     if (!uri || seen.has(uri)) continue;
     seen.add(uri);
-    const kind: Kind = entry.folderUri ? "folder" : entry.workspace ? "workspace" : "file";
+    const kind: Kind = entry.folderUri ? 'folder' : (entry.workspace ? 'workspace' : 'file');
 
-    if (uri.startsWith("file://")) {
+    if (uri.startsWith('file://')) {
       const item = toLocalItem(uri, kind);
       if (item) items.push(item);
-    } else if (uri.startsWith("vscode-remote://")) {
+    } else if (uri.startsWith('vscode-remote://')) {
       items.push(toRemoteItem(uri, kind, entry));
     }
     // other schemes (vscode-vfs://, etc.) are skipped
@@ -185,27 +189,27 @@ function toItems(rows: Row[] | undefined): Item[] {
 
 async function runOpen(args: string[]) {
   try {
-    await execFileAsync("/usr/bin/open", args);
+    await execFileAsync('/usr/bin/open', args);
   } catch (error) {
     await showToast({
       style: Toast.Style.Failure,
-      title: "Failed to open project",
-      message: error instanceof Error ? error.message : String(error),
+      title: 'Failed to open project',
+      message: extractErrorMessage(error, false) ?? 'Unknown error'
     });
   }
 }
 
 function openLocal(path: string, newWindow = false) {
-  return runOpen(["-a", appName, ...(newWindow ? ["-n"] : []), path]);
+  return runOpen(['-a', appName, ...(newWindow ? ['-n'] : []), path]);
 }
 
 // Same approach as the original extension on macOS:
 // vscode-remote://... -> <scheme>://vscode-remote/..., windowId=_blank forces a new window.
 function openRemote(uri: string, newWindow: boolean) {
-  const url = new URL(uri.replace("vscode-remote://", `${scheme}://vscode-remote/`));
-  if (newWindow) url.searchParams.set("windowId", "_blank");
-  else url.searchParams.delete("windowId");
-  return runOpen([url.toString()]);
+  const url = new URL(uri.replace('vscode-remote://', `${scheme}://vscode-remote/`));
+  if (newWindow) url.searchParams.set('windowId', '_blank');
+  else url.searchParams.delete('windowId');
+  return runOpen([url.href]);
 }
 
 export default function Command() {
@@ -219,7 +223,7 @@ export default function Command() {
       {!isLoading && items.length === 0 ? (
         <List.EmptyView title="No recent projects" description={`Nothing found in ${dbPath}`} />
       ) : null}
-      {items.map((item) => (
+      {items.map(item => (
         <List.Item
           key={item.uri}
           title={item.title}
@@ -239,7 +243,7 @@ export default function Command() {
                   <Action
                     title="Open in New Window"
                     icon={Icon.NewDocument}
-                    shortcut={{ modifiers: ["cmd"], key: "n" }}
+                    shortcut={{ modifiers: ['cmd'], key: 'n' }}
                     onAction={() => openRemote(item.uri, true)}
                   />
                 </>
@@ -249,16 +253,16 @@ export default function Command() {
                   <Action
                     title="Open in New Window"
                     icon={Icon.NewDocument}
-                    shortcut={{ modifiers: ["cmd"], key: "n" }}
+                    shortcut={{ modifiers: ['cmd'], key: 'n' }}
                     onAction={() => openLocal(item.localPath, true)}
                   />
-                  <Action.ShowInFinder path={item.localPath} shortcut={{ modifiers: ["cmd"], key: "f" }} />
+                  <Action.ShowInFinder path={item.localPath} shortcut={{ modifiers: ['cmd'], key: 'f' }} />
                 </>
               )}
               <Action.CopyToClipboard
-                title={item.remote ? "Copy URI" : "Copy Path"}
+                title={item.remote ? 'Copy URI' : 'Copy Path'}
                 content={item.remote ? item.uri : item.localPath}
-                shortcut={{ modifiers: ["cmd", "shift"], key: "c" }}
+                shortcut={{ modifiers: ['cmd', 'shift'], key: 'c' }}
               />
             </ActionPanel>
           }
