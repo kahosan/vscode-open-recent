@@ -45,22 +45,22 @@ const globalStorageDir = join(homedir(), 'Library', 'Application Support', build
 
 // Newer builds keep the recent list in a shared DB: ~/<sharedDataFolderName>/sharedStorage/state.vscdb
 // (folder name comes from the app's product.json). Same lookup order as the original extension.
-function getSharedDbPath(): string | undefined {
-  const productJson = findInAppDirs(bundle, 'Contents', 'Resources', 'app', 'product.json');
-  if (!productJson) return undefined;
-  try {
-    const { sharedDataFolderName } = JSON.parse(readFileSync(productJson, 'utf-8')) as {
-      sharedDataFolderName?: string
-    };
-    return sharedDataFolderName ? join(homedir(), sharedDataFolderName, 'sharedStorage', 'state.vscdb') : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 function getDbPath(): string {
-  const shared = getSharedDbPath();
-  return shared && existsSync(shared) ? shared : join(globalStorageDir, 'state.vscdb');
+  const productJson = findInAppDirs(bundle, 'Contents', 'Resources', 'app', 'product.json');
+  if (productJson) {
+    try {
+      const { sharedDataFolderName } = JSON.parse(readFileSync(productJson, 'utf-8')) as {
+        sharedDataFolderName?: string
+      };
+      if (sharedDataFolderName) {
+        const shared = join(homedir(), sharedDataFolderName, 'sharedStorage', 'state.vscdb');
+        if (existsSync(shared)) return shared;
+      }
+    } catch {
+      /* fall back to the per-user global storage DB */
+    }
+  }
+  return join(globalStorageDir, 'state.vscdb');
 }
 
 const dbPath = getDbPath();
@@ -116,15 +116,6 @@ function safeDecode(value: string): string {
   }
 }
 
-function parseEntries(rows: Row[]): Entry[] {
-  if (!rows[0]?.entries) return [];
-  try {
-    return JSON.parse(rows[0].entries) as Entry[];
-  } catch {
-    return [];
-  }
-}
-
 function toLocalItem(uri: string, kind: Kind): LocalItem | undefined {
   // `fileURLToPath` already decodes the URI, so `basename` is the real folder name.
   const path = fileURLToPath(uri);
@@ -167,10 +158,19 @@ function toRemoteItem(uri: string, kind: Kind, entry: Entry): RemoteItem {
 
 function toItems(rows: Row[] | undefined): Item[] {
   if (!rows) return []; // undefined while useSQL is still loading
+
+  let entries: Entry[] = [];
+  try {
+    const raw = rows[0]?.entries;
+    if (raw) entries = JSON.parse(raw) as Entry[];
+  } catch {
+    /* ignore malformed history */
+  }
+
   const items: Item[] = [];
   const seen = new Set<string>();
 
-  for (const entry of parseEntries(rows)) {
+  for (const entry of entries) {
     const uri = entry.folderUri ?? entry.workspace?.configPath ?? entry.fileUri;
     if (!uri || seen.has(uri)) continue;
     seen.add(uri);
