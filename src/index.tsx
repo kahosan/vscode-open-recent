@@ -7,20 +7,23 @@ import { execFile } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { basename, dirname, join } from 'path';
 
+import { z } from 'zod/mini';
 import { useSQL } from '@raycast/utils';
 import { extractErrorMessage } from 'foxts/extract-error-message';
 import { Action, ActionPanel, getPreferenceValues, Icon, List, showToast, Toast } from '@raycast/api';
 
 const execFileAsync = promisify(execFile);
 
-// App bundles can live in either of these directories.
-const APP_DIRS = ['/Applications', join(homedir(), 'Applications')];
+const HOME = homedir();
 
-interface Build { app: string, bundle: string, scheme: string }
+// App bundles can live in either of these directories.
+const APP_DIRS = ['/Applications', join(HOME, 'Applications')];
+
+interface EditorBuild { app: string, bundle: string, scheme: string }
 
 // build (folder under ~/Library/Application Support) -> app name for `open -a`,
 // app bundle (to find product.json) and URL scheme for remote entries
-const BUILDS: Record<string, Build> = {
+const EDITOR_BUILDS: Record<string, EditorBuild> = {
   Code: { app: 'Visual Studio Code', bundle: 'Visual Studio Code.app', scheme: 'vscode' },
   'Code - Insiders': {
     app: 'Visual Studio Code - Insiders',
@@ -32,28 +35,32 @@ const BUILDS: Record<string, Build> = {
   Windsurf: { app: 'Windsurf', bundle: 'Windsurf.app', scheme: 'windsurf' }
 };
 
-const build = getPreferenceValues<Preferences>().build;
-const { app: appName, bundle, scheme } = BUILDS[build] ?? BUILDS.Code;
+const { build } = getPreferenceValues<Preferences>();
+const { app: appName, bundle, scheme } = EDITOR_BUILDS[build] ?? EDITOR_BUILDS.Code;
 
-function findInAppDirs(...segments: string[]): string | undefined {
+function locateInAppDirs(...segments: string[]): string | undefined {
   return APP_DIRS.map(dir => join(dir, ...segments)).find(candidate => existsSync(candidate));
 }
 
-const appPath = findInAppDirs(bundle);
+function withHomeAbbreviated(path: string): string {
+  return path.startsWith(`${HOME}/`) ? `~${path.slice(HOME.length)}` : path;
+}
+
+const appPath = locateInAppDirs(bundle);
 const appIcon: Image.ImageLike = appPath ? { fileIcon: appPath } : Icon.Code;
-const globalStorageDir = join(homedir(), 'Library', 'Application Support', build, 'User', 'globalStorage');
+const globalStorageDir = join(HOME, 'Library', 'Application Support', build, 'User', 'globalStorage');
 
 // Newer builds keep the recent list in a shared DB: ~/<sharedDataFolderName>/sharedStorage/state.vscdb
 // (folder name comes from the app's product.json). Same lookup order as the original extension.
-function getDbPath(): string {
-  const productJson = findInAppDirs(bundle, 'Contents', 'Resources', 'app', 'product.json');
+function resolveDBPath(): string {
+  const productJson = locateInAppDirs(bundle, 'Contents', 'Resources', 'app', 'product.json');
   if (productJson) {
     try {
       const { sharedDataFolderName } = JSON.parse(readFileSync(productJson, 'utf-8')) as {
         sharedDataFolderName?: string
       };
       if (sharedDataFolderName) {
-        const shared = join(homedir(), sharedDataFolderName, 'sharedStorage', 'state.vscdb');
+        const shared = join(HOME, sharedDataFolderName, 'sharedStorage', 'state.vscdb');
         if (existsSync(shared)) return shared;
       }
     } catch {
@@ -63,32 +70,50 @@ function getDbPath(): string {
   return join(globalStorageDir, 'state.vscdb');
 }
 
-const dbPath = getDbPath();
+const DB_PATH = resolveDBPath();
 
-interface Row { entries: string }
+interface RecentRow { entries: string | null }
 
-interface Entry {
-  folderUri?: string
-  fileUri?: string
-  workspace?: { configPath: string }
-  remoteAuthority?: string
-  label?: string
-}
+// The history blob is written by the editor, not by us, so validate it rather than casting:
+// `looseObject` keeps whatever extra fields a given build adds.
+const WorkspaceSchema = z.looseObject({
+  configPath: z.optional(z.string())
+});
 
-type Kind = 'folder' | 'workspace' | 'file';
+const RecentEntrySchema = z.looseObject({
+  folderUri: z.optional(z.string()),
+  fileUri: z.optional(z.string()),
+  workspace: z.optional(WorkspaceSchema),
+  remoteAuthority: z.optional(z.string()),
+  label: z.optional(z.string())
+});
 
-interface ItemBase {
+type RecentEntry = z.infer<typeof RecentEntrySchema>;
+
+type EntryKind = 'folder' | 'workspace' | 'file';
+
+interface RecentItemBase {
   uri: string
-  kind: Kind
+  kind: EntryKind
   title: string
   subtitle: string
   keywords: string[]
   icon: Image.ImageLike
 }
 
-type LocalItem = ItemBase & { remote: false, localPath: string };
-type RemoteItem = ItemBase & { remote: true, tag: string };
-type Item = LocalItem | RemoteItem;
+type RecentTarget = 'local' | 'remote';
+
+interface LocalRecentItem extends RecentItemBase {
+  target: Extract<RecentTarget, 'local'>
+  localPath: string
+}
+
+interface RemoteRecentItem extends RecentItemBase {
+  target: Extract<RecentTarget, 'remote'>
+  tag: string
+}
+
+type RecentItem = LocalRecentItem | RemoteRecentItem;
 
 // Same key the original extension reads (older builds used history.recentlyOpenedPathsList).
 const QUERY = `
@@ -99,7 +124,7 @@ const QUERY = `
   LIMIT 1
 `;
 
-function formatAuthority(authority: string): string {
+function describeAuthority(authority: string): string {
   if (authority.startsWith('ssh-remote+')) return `SSH: ${authority.slice('ssh-remote+'.length)}`;
   if (authority.startsWith('wsl+')) return `WSL: ${authority.slice(4)}`;
   if (authority.startsWith('dev-container+')) return 'Dev Container';
@@ -108,86 +133,88 @@ function formatAuthority(authority: string): string {
   return authority;
 }
 
-function safeDecode(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
+// A single entry from the history blob -> a list item, or undefined when we can't open it
+// (no URI, removed project, unparsable URI, scheme we don't handle).
+function buildItem(entry: RecentEntry): RecentItem | undefined {
+  const uri = entry.folderUri ?? entry.workspace?.configPath ?? entry.fileUri;
+  if (!uri) return;
+
+  const kind: EntryKind = entry.folderUri ? 'folder' : (entry.workspace ? 'workspace' : 'file');
+
+  if (uri.startsWith('file://')) {
+    const path = fileURLToPath(uri);
+    if (!existsSync(path)) return; // project was deleted or moved
+
+    return {
+      uri,
+      kind,
+      target: 'local',
+      icon: { fileIcon: path },
+      title: basename(path),
+      subtitle: withHomeAbbreviated(dirname(path)),
+      keywords: path.split('/').filter(Boolean),
+      localPath: path
+    };
+  }
+
+  if (uri.startsWith('vscode-remote://')) {
+    const url = new URL(uri);
+    const authority = entry.remoteAuthority ?? decodeURIComponent(url.host);
+    const remotePath = decodeURIComponent(url.pathname) || '/';
+
+    return {
+      uri,
+      kind,
+      target: 'remote',
+      icon: Icon.Folder,
+      title: basename(remotePath) || remotePath,
+      subtitle: dirname(remotePath),
+      tag: describeAuthority(authority),
+      keywords: [
+        ...authority.split('+'),
+        ...remotePath.split('/').filter(Boolean),
+        ...(entry.label ? [entry.label] : [])
+      ]
+    };
   }
 }
 
-function toLocalItem(uri: string, kind: Kind): LocalItem | undefined {
-  // `fileURLToPath` already decodes the URI, so `basename` is the real folder name.
-  const path = fileURLToPath(uri);
-  if (!existsSync(path)) return undefined; // project was deleted or moved
-  return {
-    uri,
-    kind,
-    remote: false,
-    icon: { fileIcon: path },
-    title: basename(path),
-    subtitle: dirname(path).replace(homedir(), '~'),
-    keywords: path.split('/').filter(Boolean),
-    localPath: path
-  };
-}
-
-function toRemoteItem(uri: string, kind: Kind, entry: Entry): RemoteItem {
-  const authority = entry.remoteAuthority ?? safeDecode(new URL(uri).host);
-  let remotePath = '/';
-  try {
-    remotePath = safeDecode(new URL(uri).pathname);
-  } catch {
-    /* keep "/" */
-  }
-  return {
-    uri,
-    kind,
-    remote: true,
-    icon: Icon.Folder,
-    title: basename(remotePath) || remotePath,
-    subtitle: dirname(remotePath),
-    tag: formatAuthority(authority),
-    keywords: [
-      ...authority.split('+'),
-      ...remotePath.split('/').filter(Boolean),
-      ...(entry.label ? [entry.label] : [])
-    ]
-  };
-}
-
-function toItems(rows: Row[] | undefined): Item[] {
+// Reads the JSON blob `useSQL` handed back and turns every entry we can open into a list item.
+function parseRecentItems(rows: RecentRow[] | undefined): RecentItem[] {
   if (!rows) return []; // undefined while useSQL is still loading
 
-  let entries: Entry[] = [];
+  let decoded: unknown;
   try {
-    const raw = rows[0]?.entries;
-    if (raw) entries = JSON.parse(raw) as Entry[];
+    decoded = JSON.parse(rows.at(0)?.entries ?? '');
   } catch {
-    /* ignore malformed history */
+    return []; // malformed history
   }
+  if (!Array.isArray(decoded)) return [];
 
-  const items: Item[] = [];
+  const items: RecentItem[] = [];
   const seen = new Set<string>();
 
-  for (const entry of entries) {
-    const uri = entry.folderUri ?? entry.workspace?.configPath ?? entry.fileUri;
-    if (!uri || seen.has(uri)) continue;
-    seen.add(uri);
-    const kind: Kind = entry.folderUri ? 'folder' : (entry.workspace ? 'workspace' : 'file');
+  // Entries are validated and built one at a time on purpose: a single entry the editor wrote in
+  // a shape we don't expect shouldn't take the whole list down with it.
+  for (const candidate of decoded) {
+    const { data: entry, success } = z.safeParse(RecentEntrySchema, candidate);
+    if (!success) continue;
 
-    if (uri.startsWith('file://')) {
-      const item = toLocalItem(uri, kind);
-      if (item) items.push(item);
-    } else if (uri.startsWith('vscode-remote://')) {
-      items.push(toRemoteItem(uri, kind, entry));
+    let item: RecentItem | undefined;
+    try {
+      item = buildItem(entry);
+    } catch {
+      continue; // unparsable URI for an entry that passed the schema
     }
-    // other schemes (vscode-vfs://, etc.) are skipped
+    if (!item || seen.has(item.uri)) continue;
+
+    seen.add(item.uri);
+    items.push(item);
   }
   return items;
 }
 
-async function runOpen(args: string[]) {
+async function execOpen(args: string[]) {
   try {
     await execFileAsync('/usr/bin/open', args);
   } catch (error) {
@@ -199,29 +226,34 @@ async function runOpen(args: string[]) {
   }
 }
 
-function openLocal(path: string, newWindow = false) {
-  return runOpen(['-a', appName, ...(newWindow ? ['-n'] : []), path]);
+function openLocalPath(path: string, newWindow = false) {
+  return execOpen(['-a', appName, ...(newWindow ? ['-n'] : []), path]);
 }
 
 // Same approach as the original extension on macOS:
 // vscode-remote://... -> <scheme>://vscode-remote/..., windowId=_blank forces a new window.
-function openRemote(uri: string, newWindow: boolean) {
+function openRemoteUri(uri: string, newWindow: boolean) {
   const url = new URL(uri.replace('vscode-remote://', `${scheme}://vscode-remote/`));
   if (newWindow) url.searchParams.set('windowId', '_blank');
   else url.searchParams.delete('windowId');
-  return runOpen([url.href]);
+  return execOpen([url.href]);
 }
 
 export default function Command() {
-  const { data, isLoading, permissionView } = useSQL<Row>(dbPath, QUERY);
+  const { data, isLoading, error, permissionView } = useSQL<RecentRow>(DB_PATH, QUERY);
   if (permissionView) return permissionView;
 
-  const items = toItems(data);
+  const items = parseRecentItems(data);
 
   return (
     <List isLoading={isLoading} searchBarPlaceholder="Search recent projects...">
       {!isLoading && items.length === 0 ? (
-        <List.EmptyView title="No recent projects" description={`Nothing found in ${dbPath}`} />
+        <List.EmptyView
+          title={error ? 'Could not read recent projects' : 'No recent projects'}
+          description={
+            error ? (extractErrorMessage(error) ?? 'Unknown error') : `Nothing found in ${DB_PATH}`
+          }
+        />
       ) : null}
       {items.map(item => (
         <List.Item
@@ -229,39 +261,43 @@ export default function Command() {
           title={item.title}
           subtitle={item.subtitle}
           icon={item.icon}
-          accessories={item.remote ? [{ tag: item.tag }] : []}
+          accessories={item.target === 'remote' ? [{ tag: item.tag }] : []}
           keywords={item.keywords}
           actions={
             <ActionPanel>
-              {item.remote ? (
+              {item.target === 'remote' ? (
                 <>
                   <Action
                     title={`Open in ${appName}`}
                     icon="action-icon.png"
-                    onAction={() => openRemote(item.uri, false)}
+                    onAction={() => openRemoteUri(item.uri, false)}
                   />
                   <Action
                     title="Open in New Window"
                     icon={Icon.NewDocument}
                     shortcut={{ modifiers: ['cmd'], key: 'n' }}
-                    onAction={() => openRemote(item.uri, true)}
+                    onAction={() => openRemoteUri(item.uri, true)}
                   />
                 </>
               ) : (
                 <>
-                  <Action title={`Open in ${appName}`} icon={appIcon} onAction={() => openLocal(item.localPath)} />
+                  <Action
+                    title={`Open in ${appName}`}
+                    icon={appIcon}
+                    onAction={() => openLocalPath(item.localPath)}
+                  />
                   <Action
                     title="Open in New Window"
                     icon={Icon.NewDocument}
                     shortcut={{ modifiers: ['cmd'], key: 'n' }}
-                    onAction={() => openLocal(item.localPath, true)}
+                    onAction={() => openLocalPath(item.localPath, true)}
                   />
                   <Action.ShowInFinder path={item.localPath} shortcut={{ modifiers: ['cmd'], key: 'f' }} />
                 </>
               )}
               <Action.CopyToClipboard
-                title={item.remote ? 'Copy URI' : 'Copy Path'}
-                content={item.remote ? item.uri : item.localPath}
+                title={item.target === 'remote' ? 'Copy URI' : 'Copy Path'}
+                content={item.target === 'remote' ? item.uri : item.localPath}
                 shortcut={{ modifiers: ['cmd', 'shift'], key: 'c' }}
               />
             </ActionPanel>
