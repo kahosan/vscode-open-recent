@@ -10,7 +10,16 @@ import { basename, dirname, join } from 'path';
 import { z } from 'zod/mini';
 import { useSQL } from '@raycast/utils';
 import { extractErrorMessage } from 'foxts/extract-error-message';
-import { Action, ActionPanel, getPreferenceValues, Icon, List, showToast, Toast } from '@raycast/api';
+import {
+  Action,
+  ActionPanel,
+  closeMainWindow,
+  getPreferenceValues,
+  Icon,
+  List,
+  showToast,
+  Toast
+} from '@raycast/api';
 
 const execFileAsync = promisify(execFile);
 
@@ -217,26 +226,30 @@ function parseRecentItems(rows: RecentRow[] | undefined): RecentItem[] {
 async function execOpen(args: string[]) {
   try {
     await execFileAsync('/usr/bin/open', args);
+    return true;
   } catch (error) {
     await showToast({
       style: Toast.Style.Failure,
       title: 'Failed to open project',
       message: extractErrorMessage(error, false) ?? 'Unknown error'
     });
+    return false;
   }
 }
 
-function openLocalPath(path: string, newWindow = false) {
-  return execOpen(['-a', appName, ...(newWindow ? ['-n'] : []), path]);
+async function openLocalPath(path: string, newWindow = false) {
+  const opened = await execOpen(['-a', appName, ...(newWindow ? ['-n'] : []), path]);
+  if (opened) await closeMainWindow();
 }
 
 // Same approach as the original extension on macOS:
 // vscode-remote://... -> <scheme>://vscode-remote/..., windowId=_blank forces a new window.
-function openRemoteUri(uri: string, newWindow: boolean) {
+async function openRemoteUri(uri: string, newWindow: boolean) {
   const url = new URL(uri.replace('vscode-remote://', `${scheme}://vscode-remote/`));
   if (newWindow) url.searchParams.set('windowId', '_blank');
   else url.searchParams.delete('windowId');
-  return execOpen([url.href]);
+  const opened = await execOpen([url.href]);
+  if (opened) await closeMainWindow();
 }
 
 export default function Command() {
