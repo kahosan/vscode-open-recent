@@ -1,9 +1,7 @@
 import type { Image } from '@raycast/api';
 
 import { homedir } from 'os';
-import { promisify } from 'util';
 import { fileURLToPath } from 'url';
-import { execFile } from 'child_process';
 import { existsSync, readFileSync } from 'fs';
 import { basename, dirname, join } from 'path';
 
@@ -13,15 +11,14 @@ import { extractErrorMessage } from 'foxts/extract-error-message';
 import {
   Action,
   ActionPanel,
-  closeMainWindow,
+  getApplications,
   getPreferenceValues,
   Icon,
   List,
+  open,
   showToast,
   Toast
 } from '@raycast/api';
-
-const execFileAsync = promisify(execFile);
 
 const HOME = homedir();
 
@@ -29,6 +26,14 @@ const HOME = homedir();
 const APP_DIRS = ['/Applications', join(HOME, 'Applications')];
 
 interface EditorBuild { app: string, bundle: string, scheme: string }
+
+const BUNDLE_IDS: Record<string, string> = {
+  Code: 'com.microsoft.VSCode',
+  'Code - Insiders': 'com.microsoft.VSCodeInsiders',
+  Cursor: 'com.todesktop.230313mzl4w4u92',
+  VSCodium: 'com.vscodium',
+  Windsurf: 'com.exafunction.windsurf'
+};
 
 // build (folder under ~/Library/Application Support) -> app name for `open -a`,
 // app bundle (to find product.json) and URL scheme for remote entries
@@ -223,33 +228,24 @@ function parseRecentItems(rows: RecentRow[] | undefined): RecentItem[] {
   return items;
 }
 
-async function execOpen(args: string[]) {
-  try {
-    await execFileAsync('/usr/bin/open', args);
-    return true;
-  } catch (error) {
-    await showToast({
-      style: Toast.Style.Failure,
-      title: 'Failed to open project',
-      message: extractErrorMessage(error, false) ?? 'Unknown error'
-    });
-    return false;
+async function getEditorApplication() {
+  const apps = await getApplications();
+  return apps.find(a => a.bundleId === BUNDLE_IDS[build]);
+}
+
+async function openLocalPath(uri: string) {
+  const app = await getEditorApplication();
+  if (!app) {
+    await showToast({ style: Toast.Style.Failure, title: `${appName} not found` });
+    return;
   }
+  await open(uri, app);
 }
 
-async function openLocalPath(path: string, newWindow = false) {
-  const opened = await execOpen(['-a', appName, ...(newWindow ? ['-n'] : []), path]);
-  if (opened) await closeMainWindow();
-}
-
-// Same approach as the original extension on macOS:
-// vscode-remote://... -> <scheme>://vscode-remote/..., windowId=_blank forces a new window.
-async function openRemoteUri(uri: string, newWindow: boolean) {
+function getRemoteUrl(uri: string) {
   const url = new URL(uri.replace('vscode-remote://', `${scheme}://vscode-remote/`));
-  if (newWindow) url.searchParams.set('windowId', '_blank');
-  else url.searchParams.delete('windowId');
-  const opened = await execOpen([url.href]);
-  if (opened) await closeMainWindow();
+  url.searchParams.set('windowId', '_blank');
+  return url.href;
 }
 
 export default function Command() {
@@ -279,31 +275,17 @@ export default function Command() {
           actions={
             <ActionPanel>
               {item.target === 'remote' ? (
-                <>
-                  <Action
-                    title={`Open in ${appName}`}
-                    icon="action-icon.png"
-                    onAction={() => openRemoteUri(item.uri, false)}
-                  />
-                  <Action
-                    title="Open in New Window"
-                    icon={Icon.NewDocument}
-                    shortcut={{ modifiers: ['cmd'], key: 'n' }}
-                    onAction={() => openRemoteUri(item.uri, true)}
-                  />
-                </>
+                <Action.OpenInBrowser
+                  title={`Open in ${appName}`}
+                  icon="action-icon.png"
+                  url={getRemoteUrl(item.uri)}
+                />
               ) : (
                 <>
                   <Action
                     title={`Open in ${appName}`}
                     icon={appIcon}
-                    onAction={() => openLocalPath(item.localPath)}
-                  />
-                  <Action
-                    title="Open in New Window"
-                    icon={Icon.NewDocument}
-                    shortcut={{ modifiers: ['cmd'], key: 'n' }}
-                    onAction={() => openLocalPath(item.localPath, true)}
+                    onAction={() => openLocalPath(item.uri)}
                   />
                   <Action.ShowInFinder path={item.localPath} shortcut={{ modifiers: ['cmd'], key: 'f' }} />
                 </>
